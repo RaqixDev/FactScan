@@ -1,0 +1,6 @@
+pdfplumber
+PyMuPDF
+pytesseract
+Pillow
+anthropic
+PyQt6
