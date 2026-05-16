@@ -2,6 +2,7 @@
 FactScan — Procesador de Facturas A3Con
 Workflow: importar PDFs → procesar todo (auto si NIF conocido) → guardar DAT
 """
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -32,18 +33,21 @@ from config import RUTA_A3CON
 
 
 CAMPOS_PLANTILLA = [
+    # Campos de posición fija → coordenadas de plantilla (prioridad)
     ('num_factura', 'Nº Factura'),
     ('fecha',       'Fecha'),
-    ('base_1',      'Base 1'),
-    ('tipo_iva_1',  '% IVA 1'),
-    ('cuota_iva_1', 'Cuota 1'),
-    ('base_2',      'Base 2  (opcional)'),
-    ('tipo_iva_2',  '% IVA 2  (opcional)'),
-    ('cuota_iva_2', 'Cuota 2  (opcional)'),
-    ('base_3',      'Base 3  (opcional)'),
-    ('tipo_iva_3',  '% IVA 3  (opcional)'),
-    ('cuota_iva_3', 'Cuota 3  (opcional)'),
-    ('total',       'Total'),
+    # Campos de importe → deducción numérica automática (última página)
+    # Las coordenadas aquí son solo respaldo si la deducción falla
+    ('base_1',      'Base 1  ★auto'),
+    ('tipo_iva_1',  '% IVA 1  ★auto'),
+    ('cuota_iva_1', 'Cuota 1  ★auto'),
+    ('base_2',      'Base 2  ★auto'),
+    ('tipo_iva_2',  '% IVA 2  ★auto'),
+    ('cuota_iva_2', 'Cuota 2  ★auto'),
+    ('base_3',      'Base 3  ★auto'),
+    ('tipo_iva_3',  '% IVA 3  ★auto'),
+    ('cuota_iva_3', 'Cuota 3  ★auto'),
+    ('total',       'Total  ★auto'),
 ]
 COLORES_CAMPO = {
     'num_factura': '#E91E63', 'fecha': '#9C27B0',
@@ -57,22 +61,74 @@ COLORES_CAMPO = {
 COL_ESTADO, COL_FICHERO, COL_PROV, COL_NUMFAC, COL_TOTAL, COL_VEN = 0,1,2,3,4,5
 _USERDATA = Qt.ItemDataRole.UserRole   # guarda la ruta del PDF
 
+# ── Configuración persistente (última ruta, etc.) ─────────────────────────────
+_CFG_PATH = Path(__file__).parent / '.factscan_config.json'
+
+def _leer_cfg() -> dict:
+    try:
+        return json.loads(_CFG_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+def _guardar_cfg(clave: str, valor) -> None:
+    cfg = _leer_cfg()
+    cfg[clave] = valor
+    try:
+        _CFG_PATH.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+# ── Caché LRU de documentos fitz (evita reabrir el mismo PDF) ────────────────
+
+class _DocCache:
+    """Mantiene hasta `maxsize` documentos fitz abiertos en memoria."""
+    def __init__(self, maxsize: int = 20):
+        self._cache: dict[str, fitz.Document] = {}
+        self._order: list[str] = []
+        self._maxsize = maxsize
+
+    def get(self, ruta: str) -> fitz.Document:
+        if ruta in self._cache:
+            self._order.remove(ruta)
+            self._order.append(ruta)
+            return self._cache[ruta]
+        doc = fitz.open(ruta)
+        self._cache[ruta] = doc
+        self._order.append(ruta)
+        while len(self._order) > self._maxsize:
+            viejo = self._order.pop(0)
+            try:
+                self._cache.pop(viejo).close()
+            except Exception:
+                pass
+        return doc
+
+_DOC_CACHE = _DocCache()
+
 
 # ── _PaginaPDF ────────────────────────────────────────────────────────────────
 
 class _PaginaPDF(QWidget):
-    hovering  = pyqtSignal(float, float)
-    capturado = pyqtSignal(float, float, float, float)
+    hovering      = pyqtSignal(float, float)
+    capturado     = pyqtSignal(float, float, float, float)
+    overlayMovido = pyqtSignal(str, float, float, float, float)  # campo,x0,y0,x1,y1
 
     def __init__(self):
         super().__init__()
         self.setMouseTracking(True)
-        self._pixmap:    Optional[QPixmap] = None
-        self._zoom:      float = 1.0
-        self._capturando: bool = False
-        self._inicio:    Optional[QPoint] = None
-        self._actual:    Optional[QPoint] = None
-        self._overlays:  list[dict] = []
+        self._pixmap:     Optional[QPixmap] = None
+        self._zoom:       float = 1.0
+        self._capturando: bool  = False
+        self._draggable:  bool  = False       # activar en DialogPlantilla
+        self._inicio:     Optional[QPoint] = None
+        self._actual:     Optional[QPoint] = None
+        self._overlays:   list[dict] = []
+        # Estado del arrastre de overlay
+        self._drag_ov:    Optional[dict]   = None
+        self._drag_off:   Optional[QPoint] = None  # offset click dentro del rect
+        # Estado del resize de overlay
+        self._resize_ov:    Optional[dict] = None
+        self._resize_flags: int            = 0
 
     def actualizar(self, pixmap, zoom):
         self._pixmap = pixmap; self._zoom = zoom
@@ -84,8 +140,53 @@ class _PaginaPDF(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor if activo else Qt.CursorShape.ArrowCursor)
         self.update()
 
+    # Flags de borde para resize (combinables con |)
+    _L, _R, _T, _B = 1, 2, 4, 8
+    _THRESH = 8   # píxeles pantalla de tolerancia para detectar borde
+
+    # Cursores por combinación de flags
+    _CURSORES = {
+        1:  Qt.CursorShape.SizeHorCursor,    # izquierda
+        2:  Qt.CursorShape.SizeHorCursor,    # derecha
+        4:  Qt.CursorShape.SizeVerCursor,    # arriba
+        8:  Qt.CursorShape.SizeVerCursor,    # abajo
+        5:  Qt.CursorShape.SizeFDiagCursor,  # TL
+        10: Qt.CursorShape.SizeFDiagCursor,  # BR
+        6:  Qt.CursorShape.SizeBDiagCursor,  # TR
+        9:  Qt.CursorShape.SizeBDiagCursor,  # BL
+    }
+
+    def set_draggable(self, activo: bool):
+        self._draggable = activo
+
     def set_overlays(self, overlays):
         self._overlays = overlays; self.update()
+
+    def _detectar(self, pos: QPoint):
+        """
+        Devuelve (overlay, flags) para la posición dada.
+        flags != 0  → resize (indica qué bordes)
+        flags == 0  → drag interior
+        (None, 0)   → sin overlay
+        """
+        z = self._zoom
+        T = self._THRESH
+        for ov in reversed(self._overlays):
+            x0 = int(ov['x0'] * z); y0 = int(ov['y0'] * z)
+            x1 = int(ov['x1'] * z); y1 = int(ov['y1'] * z)
+            expanded = QRect(x0 - T, y0 - T, x1 - x0 + 2*T, y1 - y0 + 2*T)
+            if not expanded.contains(pos):
+                continue
+            f = 0
+            if abs(pos.x() - x0) <= T: f |= self._L
+            if abs(pos.x() - x1) <= T: f |= self._R
+            if abs(pos.y() - y0) <= T: f |= self._T
+            if abs(pos.y() - y1) <= T: f |= self._B
+            if f:
+                return ov, f          # borde → resize
+            if QRect(x0, y0, x1-x0, y1-y0).contains(pos):
+                return ov, 0          # interior → drag
+        return None, 0
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -106,52 +207,147 @@ class _PaginaPDF(QWidget):
         p.end()
 
     def mousePressEvent(self, e):
-        if self._capturando and e.button() == Qt.MouseButton.LeftButton:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._capturando:
             self._inicio = e.pos(); self._actual = e.pos()
+            return
+        if self._draggable:
+            ov, flags = self._detectar(e.pos())
+            if ov is None:
+                return
+            if flags:                           # borde → resize
+                self._resize_ov    = ov
+                self._resize_flags = flags
+                self.setCursor(self._CURSORES.get(flags, Qt.CursorShape.SizeAllCursor))
+            else:                               # interior → drag
+                z = self._zoom
+                self._drag_ov  = ov
+                self._drag_off = e.pos() - QPoint(int(ov['x0']*z), int(ov['y0']*z))
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
         self.hovering.emit(e.pos().x()/self._zoom, e.pos().y()/self._zoom)
-        if self._capturando and self._inicio: self._actual = e.pos(); self.update()
+
+        # ── Captura de nueva zona ────────────────────────────────────────────
+        if self._capturando and self._inicio:
+            self._actual = e.pos(); self.update(); return
+
+        # ── Resize de borde ──────────────────────────────────────────────────
+        if self._resize_ov is not None:
+            ov = self._resize_ov
+            z  = self._zoom
+            f  = self._resize_flags
+            px = e.pos().x() / z
+            py = e.pos().y() / z
+            mn = 10 / z                         # tamaño mínimo en puntos PDF
+            if f & self._L: ov['x0'] = min(px, ov['x1'] - mn)
+            if f & self._R: ov['x1'] = max(px, ov['x0'] + mn)
+            if f & self._T: ov['y0'] = min(py, ov['y1'] - mn)
+            if f & self._B: ov['y1'] = max(py, ov['y0'] + mn)
+            self.update(); return
+
+        # ── Drag de posición ─────────────────────────────────────────────────
+        if self._drag_ov and self._drag_off:
+            z  = self._zoom
+            ov = self._drag_ov
+            w  = (ov['x1'] - ov['x0'])
+            h  = (ov['y1'] - ov['y0'])
+            nx0 = (e.pos().x() - self._drag_off.x()) / z
+            ny0 = (e.pos().y() - self._drag_off.y()) / z
+            ov['x0'] = nx0;     ov['y0'] = ny0
+            ov['x1'] = nx0 + w; ov['y1'] = ny0 + h
+            self.update(); return
+
+        # ── Cursor hover (sin operación activa) ──────────────────────────────
+        if self._draggable:
+            ov, flags = self._detectar(e.pos())
+            if ov is not None:
+                if flags:
+                    self.setCursor(self._CURSORES.get(flags, Qt.CursorShape.SizeAllCursor))
+                else:
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+            elif not self._capturando:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, e):
-        if self._capturando and self._inicio and e.button() == Qt.MouseButton.LeftButton:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # ── Fin captura ──────────────────────────────────────────────────────
+        if self._capturando and self._inicio:
             rect = QRect(self._inicio, e.pos()).normalized()
             if rect.width() > 4 and rect.height() > 4:
                 z = self._zoom
                 self.capturado.emit(rect.left()/z, rect.top()/z,
                                     rect.right()/z, rect.bottom()/z)
-            self._inicio = self._actual = None; self.update()
+            self._inicio = self._actual = None; self.update(); return
+
+        # ── Fin resize ───────────────────────────────────────────────────────
+        if self._resize_ov is not None:
+            ov = self._resize_ov
+            self.overlayMovido.emit(
+                ov.get('campo', ''), ov['x0'], ov['y0'], ov['x1'], ov['y1'])
+            self._resize_ov = None; self._resize_flags = 0
+            self.setCursor(Qt.CursorShape.ArrowCursor); return
+
+        # ── Fin drag ─────────────────────────────────────────────────────────
+        if self._drag_ov:
+            ov = self._drag_ov
+            self.overlayMovido.emit(
+                ov.get('campo', ''), ov['x0'], ov['y0'], ov['x1'], ov['y1'])
+            self._drag_ov = self._drag_off = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
 
 
 # ── VisorPDF ──────────────────────────────────────────────────────────────────
 
 class VisorPDF(QWidget):
-    capturado = pyqtSignal(float, float, float, float)
+    capturado     = pyqtSignal(float, float, float, float)
+    overlayMovido = pyqtSignal(str, float, float, float, float)
 
     def __init__(self):
         super().__init__()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._doc: Optional[fitz.Document] = None
-        self._pagina = 0; self._zoom = 1.0
+        self._doc:    Optional[fitz.Document] = None
+        self._ruta:   str   = ''     # PDF actualmente cargado
+        self._pagina: int   = 0
+        self._zoom:   float = 1.0
+        self._fitted: bool  = False  # True tras el primer fit_page exitoso
 
         barra = QHBoxLayout(); barra.setContentsMargins(4,2,4,2)
+        # Zoom
         self._btn_m  = QPushButton('−'); self._btn_m.setFixedSize(28,26)
         self._lbl_z  = QLabel('―', alignment=Qt.AlignmentFlag.AlignCenter)
         self._lbl_z.setFixedWidth(46)
         self._btn_p  = QPushButton('+'); self._btn_p.setFixedSize(28,26)
         self._btn_f  = QPushButton('Encajar'); self._btn_f.setFixedHeight(26)
+        # Páginas
+        self._btn_prev = QPushButton('◀'); self._btn_prev.setFixedSize(26,26)
+        self._btn_next = QPushButton('▶'); self._btn_next.setFixedSize(26,26)
+        self._lbl_pag  = QLabel('―', alignment=Qt.AlignmentFlag.AlignCenter)
+        self._lbl_pag.setFixedWidth(42)
+        self._lbl_pag.setStyleSheet('font-size:10px;')
+        # Coordenadas
         self._lbl_xy = QLabel('', alignment=Qt.AlignmentFlag.AlignRight)
         self._lbl_xy.setStyleSheet('color:#888;font-size:10px;')
+
         self._btn_m.clicked.connect(lambda: self._zoom_rel(0.8))
         self._btn_p.clicked.connect(lambda: self._zoom_rel(1.25))
         self._btn_f.clicked.connect(self.fit_page)
-        for w in (self._btn_m, self._lbl_z, self._btn_p, self._btn_f):
+        self._btn_prev.clicked.connect(lambda: self._ir_pagina(self._pagina - 1))
+        self._btn_next.clicked.connect(lambda: self._ir_pagina(self._pagina + 1))
+
+        sep_v = QFrame(); sep_v.setFrameShape(QFrame.Shape.VLine)
+        for w in (self._btn_m, self._lbl_z, self._btn_p, self._btn_f,
+                  sep_v, self._btn_prev, self._lbl_pag, self._btn_next):
             barra.addWidget(w)
         barra.addStretch(); barra.addWidget(self._lbl_xy)
 
         self._pw = _PaginaPDF()
         self._pw.hovering.connect(lambda x,y: self._lbl_xy.setText(f'x={x:.0f} y={y:.0f}'))
         self._pw.capturado.connect(self.capturado)
+        self._pw.overlayMovido.connect(self.overlayMovido)
 
         self._sc = QScrollArea()
         self._sc.setWidget(self._pw); self._sc.setWidgetResizable(False)
@@ -163,24 +359,81 @@ class VisorPDF(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
         lay.addLayout(barra); lay.addWidget(sep); lay.addWidget(self._sc, 1)
 
-    def cargar(self, ruta):
-        self._doc = fitz.open(ruta); self._pagina = 0
-        self._renderizar(); QTimer.singleShot(150, self.fit_page)
+    def _ir_pagina(self, n: int):
+        if not self._doc:
+            return
+        n = max(0, min(n, len(self._doc) - 1))
+        if n == self._pagina:
+            return
+        self._pagina = n
+        self._renderizar()
+        self._sc.verticalScrollBar().setValue(0)   # volver arriba al cambiar página
+
+    def pagina_actual(self) -> int:
+        return self._pagina
+
+    def cargar(self, ruta: str):
+        if ruta == self._ruta:
+            return                       # mismo PDF, no tocar nada
+
+        # Guardar posición relativa del scroll ANTES de cambiar
+        frac = self._scroll_fracs() if self._fitted else None
+
+        self._ruta   = ruta
+        self._doc    = _DOC_CACHE.get(ruta)
+        self._pagina = 0
+
+        if self._fitted:
+            # Renderizar al mismo zoom → el PDF aparece instantáneamente
+            self._renderizar()
+            # Restaurar posición de scroll tras el repintado
+            if frac:
+                QTimer.singleShot(15, lambda fx=frac[0], fy=frac[1]:
+                                  self._restore_scroll(fx, fy))
+        else:
+            # Primera carga: encajar la página
+            QTimer.singleShot(60, self.fit_page)
 
     def fit_page(self):
-        if not self._doc: return
+        if not self._doc:
+            return
         pag = self._doc[self._pagina]
         vp  = self._sc.viewport()
-        w = max(vp.width()-6, 100); h = max(vp.height()-6, 100)
-        self._set_zoom(min(w/pag.rect.width, h/pag.rect.height))
+        w   = max(vp.width()  - 6, 100)
+        h   = max(vp.height() - 6, 100)
+        self._fitted = True              # a partir de aquí conservamos zoom/scroll
+        self._set_zoom(min(w / pag.rect.width, h / pag.rect.height))
 
-    def _zoom_rel(self, f): self._set_zoom(self._zoom * f)
+    def _zoom_rel(self, f):
+        self._fitted = True              # zoom manual → conservar desde ahora
+        self._set_zoom(self._zoom * f)
+
+    # ── Helpers de scroll ─────────────────────────────────────────────────────
+
+    def _scroll_fracs(self) -> tuple[float, float]:
+        """Devuelve la posición actual del scroll como fracciones [0..1]."""
+        h = self._sc.horizontalScrollBar()
+        v = self._sc.verticalScrollBar()
+        fx = h.value() / h.maximum() if h.maximum() > 0 else 0.0
+        fy = v.value() / v.maximum() if v.maximum() > 0 else 0.0
+        return fx, fy
+
+    def _restore_scroll(self, fx: float, fy: float):
+        """Restaura el scroll a las fracciones guardadas."""
+        h = self._sc.horizontalScrollBar()
+        v = self._sc.verticalScrollBar()
+        h.setValue(int(fx * h.maximum()))
+        v.setValue(int(fy * v.maximum()))
 
     def _set_zoom(self, z):
         self._zoom = max(0.15, min(5.0, z)); self._renderizar()
 
     def _renderizar(self):
         if not self._doc: return
+        total_pags = len(self._doc)
+        self._lbl_pag.setText(f'p.{self._pagina+1}/{total_pags}')
+        self._btn_prev.setEnabled(self._pagina > 0)
+        self._btn_next.setEnabled(self._pagina < total_pags - 1)
         pag = self._doc[self._pagina]
         mat = fitz.Matrix(self._zoom, self._zoom)
         pix = pag.get_pixmap(matrix=mat, alpha=False)
@@ -189,8 +442,9 @@ class VisorPDF(QWidget):
         self._pw.actualizar(QPixmap.fromImage(img), self._zoom)
         self._lbl_z.setText(f'{int(self._zoom*100)}%')
 
-    def set_modo_captura(self, a): self._pw.set_captura(a)
-    def set_overlays(self, ov):    self._pw.set_overlays(ov)
+    def set_modo_captura(self, a):        self._pw.set_captura(a)
+    def set_overlays(self, ov):           self._pw.set_overlays(ov)
+    def habilitar_arrastre(self, activo): self._pw.set_draggable(activo)
 
     def wheelEvent(self, e: QWheelEvent):
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -212,6 +466,8 @@ class DialogPlantilla(QDialog):
         sp = QSplitter(Qt.Orientation.Horizontal)
         self._visor = VisorPDF(); self._visor.cargar(ruta_pdf)
         self._visor.capturado.connect(self._on_area)
+        self._visor.overlayMovido.connect(self._on_overlay_movido)
+        self._visor.habilitar_arrastre(True)
         sp.addWidget(self._visor)
 
         sc = QScrollArea(); sc.setWidgetResizable(True)
@@ -238,9 +494,17 @@ class DialogPlantilla(QDialog):
             btn = QPushButton('⊕ Capturar'); btn.setFixedHeight(22)
             btn.setStyleSheet(f'background:{color};color:white;font-size:10px;')
             btn.clicked.connect(lambda _,c=campo: self._iniciar(c))
+            lp_pag = QLabel('p.1'); lp_pag.setFixedWidth(26)
+            lp_pag.setStyleSheet('color:#888;font-size:9px;')
             lp = QLabel('―'); lp.setStyleSheet('color:#666;font-size:10px;')
-            fb.addWidget(btn); fb.addWidget(lp, 1); gl.addLayout(fb)
-            self._filas[campo] = {'spins': spins, 'preview': lp}
+            fb.addWidget(btn); fb.addWidget(lp_pag); fb.addWidget(lp, 1)
+            gl.addLayout(fb)
+            pag_guardada = existentes[campo]['pagina'] if campo in existentes else 0
+            lp_pag.setText(f'p.{pag_guardada + 1}')
+            self._filas[campo] = {
+                'spins': spins, 'preview': lp,
+                'pag_lbl': lp_pag, 'pagina_num': pag_guardada,
+            }
             pl.addWidget(grp)
         pl.addStretch()
         bts = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
@@ -254,16 +518,19 @@ class DialogPlantilla(QDialog):
     def _iniciar(self, campo):
         self._capturando = campo; self._visor.set_modo_captura(True)
 
-    def _on_area(self, x0,y0,x1,y1):
+    def _on_area(self, x0, y0, x1, y1):
         c = self._capturando
         if not c: return
-        f = self._filas[c]
-        for k,v in (('x0',x0),('y0',y0),('x1',x1),('y1',y1)):
+        f   = self._filas[c]
+        pag = self._visor.pagina_actual()   # página donde se capturó
+        for k, v in (('x0', x0), ('y0', y0), ('x1', x1), ('y1', y1)):
             f['spins'][k].setValue(v)
+        f['pagina_num'] = pag
+        f['pag_lbl'].setText(f'p.{pag + 1}')
         self._visor.set_modo_captura(False); self._capturando = None
         raw = extraer_por_plantilla(self._ruta_pdf,
-              [{'campo':c,'pagina':0,'x0':x0,'y0':y0,'x1':x1,'y1':y1}])
-        f['preview'].setText(raw.get(c,'') or '(vacío)')
+              [{'campo': c, 'pagina': pag, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1}])
+        f['preview'].setText(raw.get(c, '') or '(vacío)')
         f['preview'].setStyleSheet('color:#2E7D32;font-size:10px;')
         self._actualizar_overlays()
 
@@ -276,21 +543,49 @@ class DialogPlantilla(QDialog):
 
     def _actualizar_overlays(self):
         ov = []
-        for c,f in self._filas.items():
+        for c, f in self._filas.items():
             s = f['spins']
-            x0,y0,x1,y1 = s['x0'].value(),s['y0'].value(),s['x1'].value(),s['y1'].value()
-            if x1>x0 and y1>y0:
-                ov.append({'x0':x0,'y0':y0,'x1':x1,'y1':y1,
-                           'color':COLORES_CAMPO.get(c,'#888'),
-                           'label':dict(CAMPOS_PLANTILLA).get(c,c)})
+            x0, y0, x1, y1 = s['x0'].value(), s['y0'].value(), s['x1'].value(), s['y1'].value()
+            if x1 > x0 and y1 > y0:
+                ov.append({
+                    'campo': c,
+                    'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+                    'color': COLORES_CAMPO.get(c, '#888'),
+                    'label': dict(CAMPOS_PLANTILLA).get(c, c),
+                })
         self._visor.set_overlays(ov)
+
+    def _on_overlay_movido(self, campo: str, x0: float, y0: float,
+                           x1: float, y1: float):
+        """Actualiza spinboxes y preview cuando el usuario arrastra un overlay."""
+        if campo not in self._filas:
+            return
+        f = self._filas[campo]
+        for nombre, val in (('x0', x0), ('y0', y0), ('x1', x1), ('y1', y1)):
+            f['spins'][nombre].setValue(round(val, 1))
+        pag = f.get('pagina_num', 0)
+        # Re-extraer el texto de la nueva posición
+        raw = extraer_por_plantilla(self._ruta_pdf, [{
+            'campo': campo, 'pagina': pag,
+            'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+        }])
+        texto = raw.get(campo, '') or '(vacío)'
+        f['preview'].setText(texto)
+        f['preview'].setStyleSheet('color:#2E7D32; font-size:10px;')
+        # Redibujar overlays desde los spinboxes (valores limpios)
+        self._actualizar_overlays()
 
     def _construir(self):
         out = []
-        for c,f in self._filas.items():
-            s=f['spins']; x0,y0,x1,y1=s['x0'].value(),s['y0'].value(),s['x1'].value(),s['y1'].value()
-            if x1>x0 and y1>y0:
-                out.append({'campo':c,'pagina':0,'x0':x0,'y0':y0,'x1':x1,'y1':y1})
+        for c, f in self._filas.items():
+            s = f['spins']
+            x0, y0, x1, y1 = s['x0'].value(), s['y0'].value(), s['x1'].value(), s['y1'].value()
+            if x1 > x0 and y1 > y0:
+                out.append({
+                    'campo': c,
+                    'pagina': f.get('pagina_num', 0),   # página capturada
+                    'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+                })
         return out
 
     def _guardar(self):
@@ -649,12 +944,12 @@ class PanelDetalle(QGroupBox):
         ven   = (calcular_vencimiento(fecha, prov['dias_pago'], prov['dia_fijo'])
                  if isinstance(fecha, date_t) else '')
         self._campos['num_factura'].setText(str(factura.get('num_factura') or ''))
-        self._campos['fecha'].setText(str(fecha) if fecha else '')
+        self._campos['fecha'].setText(fmt_fecha(fecha))
         self._campos['proveedor'].setText(prov.get('nombre',''))
         self._campos['nif'].setText(prov.get('nif',''))
         self._campos['cuenta'].setText(prov.get('cuenta',''))
         self._campos['total'].setText(f"{factura.get('total',0):.2f} €")
-        self._campos['vencimiento'].setText(str(ven))
+        self._campos['vencimiento'].setText(fmt_fecha(ven))
         iva_ops = factura.get('iva_ops',[])
         if not iva_ops and factura.get('base',0):
             iva_ops = [{'base':factura['base'],'tipo_iva':factura['tipo_iva'],
@@ -681,8 +976,8 @@ class PanelDetalle(QGroupBox):
             try: return float(t)
             except: return 0.0
         fecha = None
-        for fmt in ('%Y-%m-%d','%d/%m/%Y','%d/%m/%y'):
-            try: fecha = datetime.strptime(self._campos['fecha'].text().strip(),fmt).date(); break
+        for fmt in ('%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%d/%m/%y'):
+            try: fecha = datetime.strptime(self._campos['fecha'].text().strip(), fmt).date(); break
             except: pass
         iva_ops = []
         for i in ('1','2','3'):
@@ -703,37 +998,58 @@ class PanelDetalle(QGroupBox):
         }
 
 
+# ── Formato de fechas ────────────────────────────────────────────────────────
+
+def fmt_fecha(d) -> str:
+    """Convierte date/datetime/str a DD-MM-YYYY para mostrar en la UI."""
+    from datetime import date as _date, datetime as _dt
+    if isinstance(d, (_date, _dt)):
+        return d.strftime('%d-%m-%Y')
+    return ''
+
+
 # ── Helpers de procesado ─────────────────────────────────────────────────────
+
+def _n_paginas(ruta: str) -> int:
+    """Devuelve el número de páginas del PDF (1 si no se puede determinar)."""
+    try:
+        doc = _DOC_CACHE.get(ruta)
+        return len(doc)
+    except Exception:
+        return 1
+
 
 def _aplicar_fallback_si_necesario(ruta: str, factura: dict) -> dict:
     """
-    Si la plantilla no extrajo importes válidos (total=0 o base=0),
-    activa el motor de deducción numérica sobre el texto completo del PDF.
-    Combina los resultados: mantiene los campos de la plantilla que sí
-    funcionaron y completa con el fallback los que están a cero.
+    Estrategia de extracción en dos niveles:
+
+    IMPORTES (base, IVA, total):
+      → Siempre por deducción numérica (busca en la última página del PDF).
+        Es robusta para facturas de longitud variable (1 o 2 páginas del mismo
+        proveedor). Solo usa las coordenadas de plantilla como último recurso
+        si la deducción numérica devuelve cero.
+
+    Nº FACTURA y FECHA:
+      → La plantilla tiene prioridad (posición fija en la factura).
+        El fallback los rellena si la plantilla no los extrajo.
     """
-    total  = factura.get('total', 0.0)
-    base   = factura.get('base', 0.0)
-    iva_ok = bool(factura.get('iva_ops'))
-
-    if total > 0 and (base > 0 or iva_ok):
-        return factura          # plantilla suficiente, no hacer nada
-
     fb = extraer_fallback_numerico(ruta)
+    fb_total = fb.get('total', 0.0)
 
-    # Importes
-    if fb.get('total', 0) > 0:
-        factura['total']   = fb['total']
-        factura['iva_ops'] = fb['iva_ops']
-        factura['base']    = fb.get('base', 0.0)
+    if fb_total > 0:
+        # Deducción numérica exitosa → usar siempre para importes
+        factura['total']     = fb_total
+        factura['iva_ops']   = fb.get('iva_ops', [])
+        factura['base']      = fb.get('base', 0.0)
         factura['tipo_iva']  = fb.get('tipo_iva', 0.0)
         factura['cuota_iva'] = fb.get('cuota_iva', 0.0)
+    # Si fb_total == 0, se conservan los importes de la plantilla (último recurso)
 
-    # Número de factura
+    # Nº Factura: plantilla primero; fallback si la plantilla no lo encontró
     if not factura.get('num_factura') and fb.get('num_factura'):
         factura['num_factura'] = fb['num_factura']
 
-    # Fecha
+    # Fecha: plantilla primero; fallback si vacía
     if not factura.get('fecha') and fb.get('fecha'):
         factura['fecha'] = fb['fecha']
 
@@ -753,6 +1069,11 @@ class VentanaPrincipal(QMainWindow):
         self._ruta_pdf: Optional[str]  = None
         # Batch: lista de resultados procesados {ruta_pdf, factura, prov, ndoc, fecha_ven}
         self._batch: list[dict] = []
+        # Debounce para navegación entre facturas
+        self._nav_timer = QTimer()
+        self._nav_timer.setSingleShot(True)
+        self._nav_timer.timeout.connect(self._nav_cargar)
+        self._nav_fila: int = -1
         self._construir_ui()
         proveedores.inicializar_db()
 
@@ -768,6 +1089,7 @@ class VentanaPrincipal(QMainWindow):
 
         self._btn_importar   = QPushButton('📂 Importar PDFs')
         self._btn_proc_todo  = QPushButton('▶ Procesar todo')
+        self._btn_proc_uno   = QPushButton('▶ Procesar esta')
         self._btn_guardar    = QPushButton('💾 Guardar DAT')
         sep1 = QFrame(); sep1.setFrameShape(QFrame.Shape.VLine)
         self._btn_plantilla  = QPushButton('📋 Plantilla')
@@ -781,19 +1103,21 @@ class VentanaPrincipal(QMainWindow):
         self._progress.setVisible(False)
 
         self._btn_proc_todo.setEnabled(False)
+        self._btn_proc_uno.setEnabled(False)
         self._btn_guardar.setEnabled(False)
         self._btn_plantilla.setEnabled(False)
         self._btn_ia.setEnabled(False)
 
         self._btn_importar.clicked.connect(self._importar_pdfs)
         self._btn_proc_todo.clicked.connect(self._procesar_todo)
+        self._btn_proc_uno.clicked.connect(self._procesar_esta)
         self._btn_guardar.clicked.connect(self._guardar_dat_batch)
         self._btn_plantilla.clicked.connect(self._editar_plantilla)
         self._btn_ia.clicked.connect(self._procesar_ia_uno)
         self._btn_proveedores.clicked.connect(self._gestionar_proveedores)
 
-        for w in (self._btn_importar, self._btn_proc_todo, self._btn_guardar,
-                  sep1, self._btn_plantilla, self._btn_ia,
+        for w in (self._btn_importar, self._btn_proc_todo, self._btn_proc_uno,
+                  self._btn_guardar, sep1, self._btn_plantilla, self._btn_ia,
                   sep2, self._btn_proveedores):
             if isinstance(w, QFrame):
                 barra.addWidget(w)
@@ -821,12 +1145,12 @@ class VentanaPrincipal(QMainWindow):
         gl  = QVBoxLayout(grp)
         self._tabla = QTableWidget()
         self._tabla.setColumnCount(6)
-        self._tabla.setHorizontalHeaderLabels(['','Fichero','Proveedor','Nº Factura','Total','Vencimiento'])
+        self._tabla.setHorizontalHeaderLabels(['','Fichero','Proveedor','Nº Factura','Total','Fecha'])
         self._tabla.setColumnWidth(COL_ESTADO, 24)
         self._tabla.horizontalHeader().setSectionResizeMode(COL_FICHERO, QHeaderView.ResizeMode.Stretch)
         self._tabla.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._tabla.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._tabla.currentCellChanged.connect(self._on_fila_cambiada)
+        self._tabla.currentCellChanged.connect(self._on_fila_seleccionada)
         gl.addWidget(self._tabla)
         izq_l.addWidget(grp)
 
@@ -844,6 +1168,8 @@ class VentanaPrincipal(QMainWindow):
 
         # Panel derecho: visor PDF
         self._visor = VisorPDF()
+        self._visor.habilitar_arrastre(True)
+        self._visor.overlayMovido.connect(self._on_overlay_movido_principal)
         splitter.addWidget(self._visor)
         splitter.setSizes([420, 980])
 
@@ -876,10 +1202,15 @@ class VentanaPrincipal(QMainWindow):
     # ── Acciones principales ──────────────────────────────────────────────────
 
     def _importar_pdfs(self):
+        ultima = _leer_cfg().get('ultima_ruta_importacion', '')
         rutas, _ = QFileDialog.getOpenFileNames(
-            self, 'Seleccionar facturas PDF', '', 'PDF (*.pdf *.PDF)'
+            self, 'Seleccionar facturas PDF', ultima, 'PDF (*.pdf *.PDF)'
         )
-        if not rutas: return
+        if not rutas:
+            return
+        # Guardar la carpeta para la próxima vez
+        _guardar_cfg('ultima_ruta_importacion', str(Path(rutas[0]).parent))
+
         for ruta in rutas:
             f = self._tabla.rowCount()
             self._tabla.insertRow(f)
@@ -891,7 +1222,6 @@ class VentanaPrincipal(QMainWindow):
                 self._tabla.setItem(f, col, QTableWidgetItem(''))
         self._btn_proc_todo.setEnabled(True)
         self._estado(f'{self._tabla.rowCount()} facturas en lista', '#1565C0')
-        # Mostrar el primer PDF recién importado
         self._tabla.selectRow(self._tabla.rowCount() - len(rutas))
 
     def _procesar_todo(self):
@@ -982,7 +1312,7 @@ class VentanaPrincipal(QMainWindow):
             self._tabla.setItem(fila, COL_PROV,   QTableWidgetItem(prov['nombre']))
             self._tabla.setItem(fila, COL_NUMFAC,  QTableWidgetItem(str(factura.get('num_factura',''))))
             self._tabla.setItem(fila, COL_TOTAL,   QTableWidgetItem(f"{factura.get('total',0):.2f} €"))
-            self._tabla.setItem(fila, COL_VEN,     QTableWidgetItem(str(fecha_ven or '')))
+            self._tabla.setItem(fila, COL_VEN,     QTableWidgetItem(fmt_fecha(fecha)))
             self._set_estado_fila(fila, '🟢', ruta)
 
             # Actualizar detalle si es la fila seleccionada
@@ -1020,13 +1350,25 @@ class VentanaPrincipal(QMainWindow):
             msg += f'\n\nErrores:\n' + '\n'.join(errores)
         QMessageBox.information(self, 'Listo', msg)
 
-    def _on_fila_cambiada(self, fila, *_):
+    # ── Navegación entre facturas (con debounce) ──────────────────────────────
+
+    def _on_fila_seleccionada(self, fila, *_):
+        """Dispara el timer; si el usuario sigue pulsando teclas no carga nada."""
+        if fila < 0:
+            return
+        self._nav_fila = fila
+        self._nav_timer.start(140)      # 140 ms de debounce
+
+    def _nav_cargar(self):
+        """Ejecutado 140 ms después del último cambio de fila."""
+        fila = self._nav_fila
+        if fila < 0:
+            return
         ruta = self._ruta_de_fila(fila)
-        if not ruta: return
+        if not ruta:
+            return
         self._ruta_pdf = ruta
-        # Mostrar PDF
-        self._visor.cargar(ruta)
-        # Buscar datos procesados
+        self._visor.cargar(ruta)        # usa caché → casi siempre instantáneo
         resultado = next((r for r in self._batch if r['ruta_pdf'] == ruta), None)
         if resultado:
             self._factura = resultado['factura']
@@ -1035,13 +1377,79 @@ class VentanaPrincipal(QMainWindow):
             self._btn_gen_uno.setEnabled(True)
             self._btn_ia.setEnabled(True)
             self._btn_plantilla.setEnabled(True)
+            self._btn_proc_uno.setText('🔄 Reprocesar')
+            self._btn_proc_uno.setEnabled(True)
             self._mostrar_overlays()
         else:
             self._factura = self._prov = None
             self._detalle.limpiar()
+            self._visor.set_overlays([])      # limpiar overlays del proveedor anterior
             self._btn_gen_uno.setEnabled(False)
             self._btn_ia.setEnabled(True)
             self._btn_plantilla.setEnabled(False)
+            self._btn_proc_uno.setText('▶ Procesar esta')
+            self._btn_proc_uno.setEnabled(True)
+
+    def _procesar_esta(self):
+        """Procesa solo la factura actualmente seleccionada en la lista."""
+        fila = self._tabla.currentRow()
+        if fila < 0:
+            return
+        # Marcar como pendiente para que _procesar_fila la acepte
+        ruta = self._ruta_de_fila(fila)
+        self._set_estado_fila(fila, '🟡', ruta)
+        self._procesar_fila(fila)
+        if self._batch:
+            self._btn_guardar.setEnabled(True)
+
+    def _on_overlay_movido_principal(self, campo: str,
+                                     x0: float, y0: float,
+                                     x1: float, y1: float):
+        """
+        El usuario arrastró un overlay en la ventana principal.
+        Guarda las nuevas coordenadas en la BD y re-extrae los datos.
+        """
+        if not self._prov or not self._ruta_pdf:
+            return
+
+        # Persistir en la BD
+        proveedores.guardar_plantilla(self._prov['nif'], [{
+            'campo': campo, 'pagina': 0,
+            'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+        }])
+
+        # Re-extraer todos los campos con la plantilla actualizada
+        plantilla = proveedores.obtener_plantilla(self._prov['nif'])
+        raw       = extraer_por_plantilla(self._ruta_pdf, plantilla)
+        factura   = parsear_campos_plantilla(raw)
+        factura   = _aplicar_fallback_si_necesario(self._ruta_pdf, factura)
+        self._factura = factura
+        self._detalle.rellenar(factura, self._prov)
+
+        # Actualizar la fila en la tabla
+        fila = self._tabla.currentRow()
+        if fila >= 0:
+            fecha = factura.get('fecha')
+            self._tabla.setItem(fila, COL_NUMFAC,
+                                QTableWidgetItem(str(factura.get('num_factura', ''))))
+            self._tabla.setItem(fila, COL_TOTAL,
+                                QTableWidgetItem(f"{factura.get('total', 0):.2f} €"))
+            self._tabla.setItem(fila, COL_VEN,
+                                QTableWidgetItem(fmt_fecha(fecha)))
+            # Actualizar también en el batch
+            for r in self._batch:
+                if r['ruta_pdf'] == self._ruta_pdf:
+                    r['factura'] = factura
+                    from datetime import date as date_t
+                    if isinstance(fecha, date_t):
+                        r['fecha_ven'] = calcular_vencimiento(
+                            fecha, self._prov['dias_pago'], self._prov['dia_fijo'])
+                    break
+
+        # Redibujar overlays con coordenadas actualizadas
+        self._mostrar_overlays()
+        self._estado(f'Plantilla ajustada — {dict(CAMPOS_PLANTILLA).get(campo, campo)}',
+                     '#1565C0')
 
     def _editar_plantilla(self):
         if not self._ruta_pdf:
@@ -1106,7 +1514,7 @@ class VentanaPrincipal(QMainWindow):
         except Exception: pass
         self._estado(f'✔ DAT guardado — NºDoc {ndoc:06d}', '#2E7D32')
         QMessageBox.information(self,'DAT generado',
-            f'NºDoc: {ndoc:06d}\nVencimiento: {fecha_ven}\n'
+            f'NºDoc: {ndoc:06d}\nVencimiento: {fmt_fecha(fecha_ven)}\n'
             f'Líneas IVA: {len(factura.get("iva_ops") or [1])}\n'
             f'PDF: R{prov["nif"]}{ndoc:06d}.PDF')
 

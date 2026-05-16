@@ -81,19 +81,57 @@ def listar_proveedores() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _coerce(campo: str, valor):
+    """Convierte el valor al tipo correcto para cada campo."""
+    if campo in ('dias_pago', 'dia_fijo'):
+        try:
+            return int(valor) if valor not in (None, '', 'None') else 0
+        except (ValueError, TypeError):
+            return 0
+    if campo == 'iva_habitual':
+        try:
+            return float(valor) if valor not in (None, '', 'None') else 10.0
+        except (ValueError, TypeError):
+            return 10.0
+    return valor if valor is not None else ''
+
+
 def insertar_proveedor(datos: dict) -> None:
-    campos = ('nif', 'nombre', 'cuenta', 'contrapartida', 'cuenta_pago',
-              'dias_pago', 'dia_fijo', 'tipo_pago', 'email', 'iva_habitual')
-    valores = tuple(datos.get(c) for c in campos)
-    sql = f"INSERT INTO proveedores ({','.join(campos)}) VALUES ({','.join('?'*len(campos))})"
+    """
+    Inserta un proveedor nuevo. Si el NIF ya existe (incluso inactivo por
+    borrado lógico), reactiva el registro y actualiza todos sus campos
+    en lugar de lanzar un error de duplicado.
+    Los campos enteros (dias_pago, dia_fijo) y decimales (iva_habitual)
+    se convierten al tipo correcto antes de guardarse.
+    """
+    nif = (datos.get('nif') or '').strip().upper()
+    campos_upd = ('nombre', 'cuenta', 'contrapartida', 'cuenta_pago',
+                  'dias_pago', 'dia_fijo', 'tipo_pago', 'email',
+                  'iva_habitual', 'palabras_clave')
     with _conexion() as conn:
-        conn.execute(sql, valores)
+        existe = conn.execute(
+            "SELECT COUNT(*) FROM proveedores WHERE nif = ?", (nif,)
+        ).fetchone()[0]
+
+        valores = [_coerce(c, datos.get(c)) for c in campos_upd]
+
+        if existe:
+            sets = ', '.join(f'{c} = ?' for c in campos_upd)
+            conn.execute(
+                f"UPDATE proveedores SET {sets}, activo = 1 WHERE nif = ?",
+                valores + [nif],
+            )
+        else:
+            campos_ins = ('nif',) + campos_upd
+            sql = (f"INSERT INTO proveedores ({','.join(campos_ins)}, activo) "
+                   f"VALUES ({','.join('?'*len(campos_ins))}, 1)")
+            conn.execute(sql, tuple([nif] + valores))
 
 
 def actualizar_proveedor(nif: str, datos: dict) -> None:
     campos = [k for k in datos if k != 'nif']
-    sets = ', '.join(f'{c} = ?' for c in campos)
-    valores = [datos[c] for c in campos] + [nif]
+    sets   = ', '.join(f'{c} = ?' for c in campos)
+    valores = [_coerce(c, datos[c]) for c in campos] + [nif]
     with _conexion() as conn:
         conn.execute(f"UPDATE proveedores SET {sets} WHERE nif = ?", valores)
 

@@ -1,12 +1,18 @@
 from datetime import date, timedelta
 
 
-def calcular_vencimiento(fecha_factura: date, dias: int, dia_fijo: int) -> date:
+def calcular_vencimiento(fecha_factura: date, dias, dia_fijo) -> date:
     """
     Suma los días de pago a la fecha de factura y ajusta al día fijo del mes.
     Si dia_fijo == 0, devuelve la fecha sin ajuste.
-    Ejemplo: 15/05/2026 + 84 días = 07/08/2026 → ajuste día 25 = 25/08/2026
+    Acepta int o str para dias/dia_fijo (la BD puede devolver strings si el
+    valor fue almacenado incorrectamente).
     """
+    try:
+        dias     = int(dias)     if dias     not in (None, '') else 0
+        dia_fijo = int(dia_fijo) if dia_fijo not in (None, '') else 0
+    except (ValueError, TypeError):
+        dias, dia_fijo = 0, 0
     fecha_raw = fecha_factura + timedelta(days=dias)
     if dia_fijo == 0:
         return fecha_raw

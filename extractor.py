@@ -77,58 +77,48 @@ def texto_completo(ruta_pdf: str) -> str:
 def identificar_proveedor_en_pdf(ruta_pdf: str) -> Optional[str]:
     """
     Estrategia multicapa para localizar el NIF del emisor:
-      1. Regex de NIF en el texto combinado
-      2. Palabras clave guardadas en la BD del proveedor
-      3. Palabras del nombre del proveedor en el texto
-      4. Nombre del fichero contra claves/nombres
-    Devuelve el NIF con mayor puntuación (si supera el umbral), o None.
+      1. Regex de NIF en el texto combinado  → retorno inmediato, máxima certeza
+      2. Palabras clave guardadas en la BD   → +5 pts por coincidencia
+      3. Palabras del nombre del proveedor que aparecen en el texto → +2 pts
+
+    Umbral de auto-identificación: 5 puntos.
+    Esto requiere al menos UNA palabra clave (+5) o TRES palabras del nombre (+6).
+    Con menos puntuación devuelve None y la UI mostrará el diálogo de selección.
+
+    NOTA: La capa "nombre de fichero" fue eliminada porque "002" en "002-factura.pdf"
+    coincidía como subcadena con "2002" en "Jamones Artesan 2002 S.L." causando
+    identificaciones erróneas. Las palabras clave explícitas son más fiables.
     """
     import proveedores as prov_db
 
-    t_completo = texto_completo(ruta_pdf).upper()
-    nombre_fich = Path(ruta_pdf).stem.upper()   # p.ej. "26-05-02-FA-007888-V30-CMAR"
-    t_busqueda  = t_completo + '\n' + nombre_fich
+    t_completo  = texto_completo(ruta_pdf).upper()
+    t_busqueda  = t_completo
 
-    # ── 1. Buscar NIF por regex ───────────────────────────────────────────────
+    # ── 1. NIF por regex ─────────────────────────────────────────────────────
     patron_nif = re.compile(r'[A-Z]\d{7}[A-Z0-9]|\d{8}[A-Z]')
     for nif in patron_nif.findall(t_busqueda):
         if prov_db.buscar_por_nif(nif):
             return nif
 
-    # ── 2-4. Puntuación por nombre / claves / fichero ─────────────────────────
+    # ── 2-3. Puntuación por claves y nombre ───────────────────────────────────
     scores: dict[str, int] = {}
-    todos   = prov_db.listar_proveedores()
+    todos = prov_db.listar_proveedores()
 
     for prov in todos:
         nif    = prov['nif']
         nombre = prov['nombre'].upper()
         score  = 0
 
-        # 2. Palabras clave guardadas (peso alto)
+        # 2. Palabras clave explícitas (alta confianza)
         claves_raw = (prov.get('palabras_clave') or '').strip()
-        if claves_raw:
-            for clave in (c.strip().upper() for c in claves_raw.split(',') if c.strip()):
-                if clave and clave in t_busqueda:
-                    score += 5
+        for clave in (c.strip().upper() for c in claves_raw.split(',') if c.strip()):
+            if clave and clave in t_busqueda:
+                score += 5
 
-        # 3. Palabras del nombre del proveedor en el texto (peso medio)
-        palabras_nombre = [
-            w for w in re.split(r'[\s,.;]+', nombre)
-            if len(w) >= 4 and w not in _TERMINOS_GENERICOS
-        ]
-        for palabra in palabras_nombre:
-            if palabra in t_busqueda:
+        # 3. Palabras significativas del nombre en el texto (≥5 chars, no genéricas)
+        for w in re.split(r'[\s,.;]+', nombre):
+            if len(w) >= 5 and w not in _TERMINOS_GENERICOS and w in t_busqueda:
                 score += 2
-
-        # 4. Nombre/clave contra nombre del fichero (peso bajo pero útil)
-        for fragmento in [nombre] + (claves_raw.upper().split(',') if claves_raw else []):
-            fragmento = fragmento.strip()
-            if len(fragmento) >= 3:
-                # Comprueba fragmento corto (tipo sigla) en el nombre del fichero
-                for parte in nombre_fich.split('-'):
-                    if parte and len(parte) >= 3 and parte in fragmento.replace(' ', ''):
-                        score += 3
-                        break
 
         if score > 0:
             scores[nif] = score
@@ -136,10 +126,10 @@ def identificar_proveedor_en_pdf(ruta_pdf: str) -> Optional[str]:
     if not scores:
         return None
 
-    # Devolver el más puntuado si supera umbral mínimo
     mejor_nif   = max(scores, key=lambda n: scores[n])
     mejor_score = scores[mejor_nif]
-    return mejor_nif if mejor_score >= 3 else None
+    # Umbral 5: requiere al menos una clave explícita o tres palabras del nombre
+    return mejor_nif if mejor_score >= 5 else None
 
 
 def sugerir_palabras_clave(ruta_pdf: str, nif_excluir: str = '') -> list[str]:
@@ -201,31 +191,122 @@ _RATES_IVA = [21.0, 10.0, 5.0, 4.0]
 def extraer_fallback_numerico(ruta_pdf: str) -> dict:
     """
     Extrae importes del PDF cuando la plantilla no funciona.
-    Recoge todos los valores monetarios del texto y deduce algebraicamente
-    qué combinación de base(s) + IVA cuadra con el total.
-    Devuelve el mismo dict que parsear_campos_plantilla.
+    Para PDFs multipágina, prueba primero la ÚLTIMA página (donde suele estar
+    el resumen de totales e IVA) — evita que subtotales intermedios de páginas
+    anteriores confundan al algoritmo.
+    Si la última página no da resultado, usa el documento completo.
     """
-    t = texto_completo(ruta_pdf)
-    return _deducir_de_texto(t, ruta_pdf)
+    try:
+        import fitz as _fitz
+        with _fitz.open(ruta_pdf) as _doc:
+            n_pags = len(_doc)
+    except Exception:
+        n_pags = 1
 
-
-def _deducir_de_texto(texto: str, ruta_pdf: str = '') -> dict:
-    # Extraer valores con exactamente 2 decimales (importes monetarios)
-    # Acepta tanto punto como coma como separador decimal
-    vals: set[float] = set()
-    for m in re.finditer(r'\b(\d{1,7})[,.](\d{2})\b', texto):
+    if n_pags > 1:
         try:
-            v = float(f'{m.group(1)}.{m.group(2)}')
+            import pdfplumber
+            with pdfplumber.open(ruta_pdf) as pdf:
+                # Texto de la última página
+                texto_ultima = (pdf.pages[-1].extract_text() or '').strip()
+                # Si hay muy poco texto en la última (p.ej. solo firma/pie),
+                # ampliar a las dos últimas páginas
+                if len(texto_ultima) < 80 and len(pdf.pages) >= 2:
+                    texto_ultima = '\n'.join(
+                        (p.extract_text() or '') for p in pdf.pages[-2:]
+                    )
+        except Exception:
+            texto_ultima = ''
+
+        if texto_ultima:
+            r = _deducir_de_texto(texto_ultima, ruta_pdf)
+            if r.get('total', 0) > 0 and r.get('iva_ops'):
+                return r   # la última página tiene todo lo necesario
+
+    # Fallback: documento completo
+    return _deducir_de_texto(texto_completo(ruta_pdf), ruta_pdf)
+
+
+def _extraer_importes(texto: str) -> list[float]:
+    """
+    Extrae importes monetarios del texto manejando formatos españoles:
+    - Con separador de miles: 1.743,95 → 1743.95  (p.ej. facturas Aribau, Makro)
+    - Sin separador de miles: 743,95  → 743.95
+    - Con punto decimal:      743.95  → 743.95
+    El orden de prioridad evita que "1.441,28" se capture solo como "441,28".
+    """
+    vals: set[float] = set()
+
+    # 1. Miles españoles: 1.234,56 o 1.234.567,89
+    for m in re.finditer(r'\b(\d{1,3}(?:\.\d{3})+),(\d{2})\b', texto):
+        try:
+            v = float(m.group(1).replace('.', '') + '.' + m.group(2))
             if v > 0:
                 vals.add(round(v, 2))
         except ValueError:
             pass
 
-    cands = sorted(vals, reverse=True)   # mayor primero
+    # 2. Decimal con coma sin miles: 743,95  (no precedido de dígito+punto)
+    for m in re.finditer(r'(?<![.\d])(\d{1,6}),(\d{2})\b', texto):
+        try:
+            v = float(m.group(1) + '.' + m.group(2))
+            if v > 0:
+                vals.add(round(v, 2))
+        except ValueError:
+            pass
 
-    # El total es el importe más alto (el que aparece al final de la factura)
-    # Si hay varios iguales elegimos el primero; si no hay nada, salimos
-    total = cands[0] if cands else 0.0
+    # 3. Decimal con punto: 743.95  (no precedido de dígito, no seguido de dígito)
+    for m in re.finditer(r'(?<![,\d])(\d{1,6})\.(\d{2})(?!\d)', texto):
+        try:
+            v = float(m.group(1) + '.' + m.group(2))
+            if v > 0:
+                vals.add(round(v, 2))
+        except ValueError:
+            pass
+
+    return sorted(vals, reverse=True)
+
+
+# Keywords que preceden al importe total de la factura (orden de prioridad)
+_KEYWORDS_TOTAL = [
+    'TOTAL FACTURA', 'TOTAL INVOICE', 'TOTAL A PAGAR', 'IMPORTE TOTAL',
+    'IMPORTE FACTURA', 'TOTAL GENERAL', 'IMPORTE A PAGAR', 'TOTAL FACT.',
+    'TOTAL FATURA', 'AMOUNT DUE', 'NET AMOUNT', 'TOTAL AMOUNT',
+    'TOTAL A COBRAR', 'IMPORTE TOTAL FACTURA',
+]
+
+
+def _total_por_contexto(texto: str, cands_set: set) -> float:
+    """
+    Busca keywords de 'TOTAL FACTURA' en el texto y devuelve el importe que
+    aparece justo después. Más fiable que 'el número más alto' cuando hay
+    acumulados o subtotales parciales en el documento.
+    """
+    t = texto.upper()
+    for kw in _KEYWORDS_TOTAL:
+        pos = t.find(kw)
+        while pos >= 0:
+            # Buscar el primer número monetario en los 200 chars siguientes
+            fragmento = t[pos + len(kw): pos + len(kw) + 200]
+            nums = _extraer_importes(fragmento)
+            for v in nums:
+                if v in cands_set and v > 0.01:
+                    return v
+            pos = t.find(kw, pos + 1)
+    return 0.0
+
+
+def _deducir_de_texto(texto: str, ruta_pdf: str = '') -> dict:
+    cands = _extraer_importes(texto)   # mayor primero
+
+    if not cands:
+        total = 0.0
+    else:
+        # Estrategia 1: buscar total por contexto (keyword + número siguiente)
+        total = _total_por_contexto(texto, set(cands))
+        # Estrategia 2: si no hay keyword, usar el valor más alto
+        if not total:
+            total = cands[0]
 
     iva_ops = _buscar_combinacion_iva(cands, total) if total > 0 else []
 
@@ -335,9 +416,11 @@ def _extraer_fecha_y_numfac(texto: str) -> tuple:
     # Número de factura — patrones más comunes
     PATRON_NUMFAC = re.compile(
         r'\b('
-        r'\d{2}/[A-Z]{1,4}/\d{3,6}/\d{2}'   # 02/FA/7888/26
-        r'|[A-Z]{1,4}[/\-]\d{4,10}'           # FAC-12345 / FV26002909
-        r'|F[AVR]?\d{6,12}'                   # FV26002909
+        r'\d{2}/[A-Z]{1,4}/\d{3,6}/\d{2}'    # 02/FA/7888/26
+        r'|[A-Z]{1,4}\d{2}[/\-]\d{4,8}'       # FV26-02913 / FV26002909
+        r'|[A-Z]{1,4}[/\-]\d{4,10}'            # FAC-12345
+        r'|[A-Z]\d{4,12}'                       # A1751 / F000669
+        r'|F[AVR]?\d{5,12}'                     # FV26002909
         r')\b'
     )
     num_factura = None
