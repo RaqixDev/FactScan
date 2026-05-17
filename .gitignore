@@ -1,0 +1,19 @@
+# Secretos — nunca subir al repositorio
+.env
+
+# Caché Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Base de datos local (datos de cada instalación)
+proveedores.db
+
+# PDFs de prueba y ficheros de salida
+factura.pdf
+SUENLACE.DAT
+*.dat
+
+# Configuración local del IDE
+.vscode/
+.idea/
