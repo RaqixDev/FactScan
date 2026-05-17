@@ -1,3 +1,6 @@
+# Secretos — nunca subir al repositorio
+.env
+
 # Caché Python
 __pycache__/
 *.pyc
