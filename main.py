@@ -24,11 +24,13 @@ import proveedores
 from extractor import (
     extraer_texto_pdf, identificar_proveedor_en_pdf,
     extraer_por_plantilla, parsear_campos_plantilla,
-    extraer_fallback_numerico, sugerir_palabras_clave, texto_completo,
+    extraer_fallback_numerico, encontrar_coords_importes,
+    sugerir_palabras_clave, texto_completo,
 )
-from ia_parser import parsear_factura
+from ia_parser import parsear_factura, parsear_factura_vision, es_pdf_imagen, ocr_pdf
 from vencimiento import calcular_vencimiento
 from generador_dat import siguiente_ndoc, generar_suenlace, guardar_dat, copiar_pdf
+from historial import registrar_factura, validar_secuencia, sugerir_num_factura
 from config import RUTA_A3CON
 
 
@@ -59,7 +61,8 @@ COLORES_CAMPO = {
 
 # Columnas de la tabla principal
 COL_ESTADO, COL_FICHERO, COL_PROV, COL_NUMFAC, COL_TOTAL, COL_VEN = 0,1,2,3,4,5
-_USERDATA = Qt.ItemDataRole.UserRole   # guarda la ruta del PDF
+_USERDATA       = Qt.ItemDataRole.UserRole       # ruta del PDF
+_USERDATA_IMAGEN = Qt.ItemDataRole.UserRole + 1  # bool: PDF sin texto (requiere Vision)
 
 # ── Configuración persistente (última ruta, etc.) ─────────────────────────────
 _CFG_PATH = Path(__file__).parent / '.factscan_config.json'
@@ -802,8 +805,8 @@ class DialogSugerirClaves(QDialog):
             'FactScan lo reconozca automáticamente la próxima vez:'
         ))
 
-        # Cargar sugerencias
-        sugerencias = sugerir_palabras_clave(ruta_pdf)
+        # Cargar sugerencias (pasamos el nombre para que busque sus palabras en el texto)
+        sugerencias = sugerir_palabras_clave(ruta_pdf, prov.get('nombre', ''))
 
         # Añadir claves ya guardadas (preseleccionadas)
         ya_guardadas = set(
@@ -1069,6 +1072,11 @@ class VentanaPrincipal(QMainWindow):
         self._ruta_pdf: Optional[str]  = None
         # Batch: lista de resultados procesados {ruta_pdf, factura, prov, ndoc, fecha_ven}
         self._batch: list[dict] = []
+        # Caché de sesión: NIFs identificados manualmente esta sesión.
+        self._nif_sesion: dict[str, str] = {}
+        # Consentimiento para Claude Vision (PDFs imagen, API de pago).
+        # False = preguntar; True = el usuario ya autorizó esta sesión.
+        self._vision_consentido: bool = False
         # Debounce para navegación entre facturas
         self._nav_timer = QTimer()
         self._nav_timer.setSingleShot(True)
@@ -1093,6 +1101,7 @@ class VentanaPrincipal(QMainWindow):
         self._btn_guardar    = QPushButton('💾 Guardar DAT')
         sep1 = QFrame(); sep1.setFrameShape(QFrame.Shape.VLine)
         self._btn_plantilla  = QPushButton('📋 Plantilla')
+        self._btn_ocr        = QPushButton('🔍 OCR → PDF texto')
         self._btn_ia         = QPushButton('🤖 IA (1 factura)')
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
         self._btn_proveedores = QPushButton('👥 Proveedores')
@@ -1106,6 +1115,7 @@ class VentanaPrincipal(QMainWindow):
         self._btn_proc_uno.setEnabled(False)
         self._btn_guardar.setEnabled(False)
         self._btn_plantilla.setEnabled(False)
+        self._btn_ocr.setEnabled(False)
         self._btn_ia.setEnabled(False)
 
         self._btn_importar.clicked.connect(self._importar_pdfs)
@@ -1113,11 +1123,13 @@ class VentanaPrincipal(QMainWindow):
         self._btn_proc_uno.clicked.connect(self._procesar_esta)
         self._btn_guardar.clicked.connect(self._guardar_dat_batch)
         self._btn_plantilla.clicked.connect(self._editar_plantilla)
+        self._btn_ocr.clicked.connect(self._hacer_ocr)
         self._btn_ia.clicked.connect(self._procesar_ia_uno)
         self._btn_proveedores.clicked.connect(self._gestionar_proveedores)
 
         for w in (self._btn_importar, self._btn_proc_todo, self._btn_proc_uno,
-                  self._btn_guardar, sep1, self._btn_plantilla, self._btn_ia,
+                  self._btn_guardar, sep1, self._btn_plantilla,
+                  self._btn_ocr, self._btn_ia,
                   sep2, self._btn_proveedores):
             if isinstance(w, QFrame):
                 barra.addWidget(w)
@@ -1211,18 +1223,30 @@ class VentanaPrincipal(QMainWindow):
         # Guardar la carpeta para la próxima vez
         _guardar_cfg('ultima_ruta_importacion', str(Path(rutas[0]).parent))
 
+        n_imagen = 0
         for ruta in rutas:
+            es_img = es_pdf_imagen(ruta)
+            if es_img:
+                n_imagen += 1
             f = self._tabla.rowCount()
             self._tabla.insertRow(f)
             item_est = QTableWidgetItem('🟡')
-            item_est.setData(_USERDATA, ruta)
+            item_est.setData(_USERDATA,        ruta)
+            item_est.setData(_USERDATA_IMAGEN, es_img)
             self._tabla.setItem(f, COL_ESTADO,  item_est)
-            self._tabla.setItem(f, COL_FICHERO,  QTableWidgetItem(Path(ruta).name))
+            # Marcar PDFs imagen con icono distintivo en el nombre de fichero
+            nombre = ('🖼 ' if es_img else '') + Path(ruta).name
+            self._tabla.setItem(f, COL_FICHERO, QTableWidgetItem(nombre))
             for col in (COL_PROV, COL_NUMFAC, COL_TOTAL, COL_VEN):
                 self._tabla.setItem(f, col, QTableWidgetItem(''))
+
         self._btn_proc_todo.setEnabled(True)
-        self._estado(f'{self._tabla.rowCount()} facturas en lista', '#1565C0')
-        self._tabla.selectRow(self._tabla.rowCount() - len(rutas))
+        total = self._tabla.rowCount()
+        msg = f'{total} facturas en lista'
+        if n_imagen:
+            msg += f'  ({n_imagen} PDF imagen — requieren 🤖 Vision)'
+        self._estado(msg, '#E65100' if n_imagen else '#1565C0')
+        self._tabla.selectRow(total - len(rutas))
 
     def _procesar_todo(self):
         pendientes = [i for i in range(self._tabla.rowCount())
@@ -1230,6 +1254,38 @@ class VentanaPrincipal(QMainWindow):
         if not pendientes:
             QMessageBox.information(self, 'Sin pendientes',
                                     'No hay facturas pendientes de procesar.'); return
+
+        # Detectar PDFs imagen entre las pendientes y pedir consentimiento
+        if not self._vision_consentido:
+            imagenes = [
+                i for i in pendientes
+                if (self._tabla.item(i, COL_ESTADO) or QTableWidgetItem())
+                   .data(_USERDATA_IMAGEN)
+            ]
+            if imagenes:
+                nombres = '\n'.join(
+                    f'  • {(self._tabla.item(i, COL_FICHERO) or QTableWidgetItem()).text()}'
+                    for i in imagenes[:5]
+                )
+                if len(imagenes) > 5:
+                    nombres += f'\n  … y {len(imagenes)-5} más'
+                resp = QMessageBox.question(
+                    self,
+                    '🖼 PDFs imagen — Claude Vision (API de pago)',
+                    f'<b>{len(imagenes)}</b> de las facturas pendientes son PDFs imagen '
+                    f'sin texto extraíble:<br><pre>{nombres}</pre><br>'
+                    f'Para procesar estas facturas se usará <b>Claude Vision</b>, '
+                    f'que consume crédito de la API de Anthropic.<br><br>'
+                    f'¿Deseas incluirlas en el procesado?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                self._vision_consentido = (resp == QMessageBox.StandardButton.Yes)
+                if not self._vision_consentido:
+                    # Excluir las imágenes de esta pasada
+                    pendientes = [i for i in pendientes if i not in imagenes]
+                    if not pendientes:
+                        self._estado('Sin facturas de texto pendientes.', '#888')
+                        return
 
         self._progress.setVisible(True)
         self._progress.setMaximum(len(pendientes))
@@ -1261,42 +1317,88 @@ class VentanaPrincipal(QMainWindow):
             nif  = identificar_proveedor_en_pdf(ruta)
             prov = proveedores.buscar_por_nif(nif) if nif else None
 
-            # Si el proveedor no está en la BD → preguntar (solo si no conocido)
+            # Si el proveedor no está en la BD → buscar en caché de sesión primero
+            if not prov:
+                t_pdf    = texto_completo(ruta)
+                clave_hash = str(hash(t_pdf[:500]))   # huella del texto
+
+                # ¿Ya se identificó este proveedor manualmente en esta sesión?
+                nif_cached = self._nif_sesion.get(clave_hash)
+                if nif_cached:
+                    prov = proveedores.buscar_por_nif(nif_cached)
+
             if not prov:
                 t_pdf = texto_completo(ruta)
-                dlg   = DialogSeleccionProveedor(t_pdf, ruta, self)
+                clave_hash = str(hash(t_pdf[:500]))
+                dlg = DialogSeleccionProveedor(t_pdf, ruta, self)
                 if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.proveedor_elegido:
                     self._set_estado_fila(fila, '⏭️', ruta)
                     return
                 prov = dlg.proveedor_elegido
+                # Guardar en caché de sesión para no volver a preguntar
+                self._nif_sesion[clave_hash] = prov['nif']
                 # Ofrecer guardar palabras clave para reconocerlo automáticamente
                 dlg_claves = DialogSugerirClaves(ruta, prov, self)
                 dlg_claves.exec()
                 # Recargar proveedor con las claves recién guardadas
                 prov = proveedores.buscar_por_nif(prov['nif'])
 
-            # Si no hay plantilla → ofrecer definirla
+            # Si no hay plantilla: continuar de todas formas (el fallback numérico
+            # extrae los importes). Solo preguntar si el usuario quiere definirla.
             if not proveedores.tiene_plantilla(prov['nif']):
                 resp = QMessageBox.question(
                     self, f'{prov["nombre"]} — sin plantilla',
-                    f'<b>{prov["nombre"]}</b> no tiene plantilla de coordenadas.<br>'
-                    '¿Definirla ahora?',
+                    f'<b>{prov["nombre"]}</b> no tiene plantilla de coordenadas.<br><br>'
+                    '¿Definirla ahora?<br>'
+                    '<small>(Si dices No, los importes se extraerán automáticamente)</small>',
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if resp == QMessageBox.StandardButton.Yes:
                     dlg = DialogPlantilla(ruta, prov, self)
-                    if dlg.exec() != QDialog.DialogCode.Accepted:
-                        self._set_estado_fila(fila, '⏭️', ruta); return
-                else:
-                    self._set_estado_fila(fila, '⏭️', ruta); return
+                    dlg.exec()   # aunque cancele, continuamos con el fallback
 
             # Extraer datos por plantilla
             plantilla = proveedores.obtener_plantilla(prov['nif'])
             raw       = extraer_por_plantilla(ruta, plantilla)
             factura   = parsear_campos_plantilla(raw)
 
-            # Fallback numérico si la plantilla no extrajo importes válidos
+            # Fallback numérico (prioriza última página para multipágina)
             factura = _aplicar_fallback_si_necesario(ruta, factura)
+
+            # Nivel 3: Claude Vision — cuando los dos niveles anteriores fallan (total=0)
+            # Se aplica a cualquier PDF (imagen o con texto), porque Vision renderiza
+            # la página como imagen y lee exactamente lo que ve el usuario en pantalla.
+            if factura.get('total', 0) == 0:
+                usar_vision = self._vision_consentido
+                if not usar_vision:
+                    nombre_fich = Path(ruta).name
+                    resp = QMessageBox.question(
+                        self,
+                        'Claude Vision — extracción visual',
+                        f'No se han podido extraer los importes de <b>{nombre_fich}</b> '
+                        f'con los métodos de texto ni OCR.<br><br>'
+                        f'<b>Claude Vision</b> analiza la factura como imagen '
+                        f'(igual que la ves en pantalla) y extrae todos los campos '
+                        f'con alta fiabilidad, independientemente del formato.<br><br>'
+                        f'Usa la API de Anthropic (coste por factura).<br><br>'
+                        f'¿Deseas procesarla con Vision?',
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    usar_vision = (resp == QMessageBox.StandardButton.Yes)
+                    if usar_vision:
+                        self._vision_consentido = True
+                if usar_vision:
+                    try:
+                        self._set_estado_fila(fila, '🔵', ruta)
+                        fac_vision = parsear_factura_vision(ruta)
+                        if fac_vision.get('total', 0) > 0:
+                            for k in ('total', 'base', 'tipo_iva', 'cuota_iva',
+                                      'iva_ops', 'num_factura', 'fecha',
+                                      'recargo', 'retencion'):
+                                if fac_vision.get(k):
+                                    factura[k] = fac_vision[k]
+                    except Exception:
+                        pass
 
             ndoc      = self._siguiente_ndoc()
             fecha     = factura.get('fecha')
@@ -1304,22 +1406,47 @@ class VentanaPrincipal(QMainWindow):
             fecha_ven = (calcular_vencimiento(fecha, prov['dias_pago'], prov['dia_fijo'])
                          if isinstance(fecha, date_t) else None)
 
+            # ── Validación de secuencia de número de factura ─────────────────
+            num_fac = factura.get('num_factura') or ''
+            val_estado, val_msg = ('sin_datos', '')
+            if num_fac and isinstance(fecha, date_t):
+                val_estado, val_msg = validar_secuencia(prov['nif'], num_fac, fecha)
+                sugerencia = sugerir_num_factura(prov['nif'], fecha)
+            else:
+                sugerencia = None
+
             self._batch.append({
                 'ruta_pdf': ruta, 'factura': factura,
                 'prov': prov, 'ndoc': ndoc, 'fecha_ven': fecha_ven,
+                'val_estado': val_estado, 'val_msg': val_msg,
             })
 
             self._tabla.setItem(fila, COL_PROV,   QTableWidgetItem(prov['nombre']))
-            self._tabla.setItem(fila, COL_NUMFAC,  QTableWidgetItem(str(factura.get('num_factura',''))))
-            self._tabla.setItem(fila, COL_TOTAL,   QTableWidgetItem(f"{factura.get('total',0):.2f} €"))
-            self._tabla.setItem(fila, COL_VEN,     QTableWidgetItem(fmt_fecha(fecha)))
-            self._set_estado_fila(fila, '🟢', ruta)
+            # Nº Factura: añadir ⚠ si la secuencia es sospechosa
+            num_txt = str(num_fac)
+            if val_estado == 'sospechoso':
+                num_txt = '⚠ ' + num_txt
+            item_num = QTableWidgetItem(num_txt)
+            if val_estado == 'sospechoso':
+                item_num.setToolTip(
+                    'Número de factura sospechoso (rompe la secuencia):\n' + val_msg
+                    + (f'\n\nRango esperado: {sugerencia}' if sugerencia else '')
+                )
+            elif sugerencia:
+                item_num.setToolTip(f'Rango esperado: {sugerencia}')
+            self._tabla.setItem(fila, COL_NUMFAC, item_num)
+            self._tabla.setItem(fila, COL_TOTAL,  QTableWidgetItem(f"{factura.get('total',0):.2f} €"))
+            self._tabla.setItem(fila, COL_VEN,    QTableWidgetItem(fmt_fecha(fecha)))
+            estado_emoji = '🟠' if val_estado == 'sospechoso' else '🟢'
+            self._set_estado_fila(fila, estado_emoji, ruta)
 
-            # Actualizar detalle si es la fila seleccionada
+            # Actualizar detalle Y overlays si es la fila seleccionada
             if self._tabla.currentRow() == fila:
                 self._factura = factura; self._prov = prov; self._ruta_pdf = ruta
                 self._detalle.rellenar(factura, prov)
                 self._btn_gen_uno.setEnabled(True)
+                self._btn_plantilla.setEnabled(True)
+                self._mostrar_overlays()
 
         except Exception as e:
             self._tabla.setItem(fila, COL_PROV, QTableWidgetItem(f'Error: {e}'))
@@ -1343,6 +1470,17 @@ class VentanaPrincipal(QMainWindow):
         for r in self._batch:
             try:
                 copiar_pdf(r['ruta_pdf'], r['prov']['nif'], r['ndoc'], carpeta)
+            except Exception:
+                pass
+        # Registrar en historial las facturas guardadas correctamente
+        from datetime import date as date_t
+        for r in self._batch:
+            try:
+                fac   = r['factura']
+                fecha = fac.get('fecha')
+                num   = fac.get('num_factura') or ''
+                if num and isinstance(fecha, date_t):
+                    registrar_factura(r['prov']['nif'], num, fecha, r['ndoc'])
             except Exception:
                 pass
         msg = (f'SUENLACE.DAT con {len(self._batch)} facturas guardado en:\n{carpeta}')
@@ -1389,6 +1527,10 @@ class VentanaPrincipal(QMainWindow):
             self._btn_plantilla.setEnabled(False)
             self._btn_proc_uno.setText('▶ Procesar esta')
             self._btn_proc_uno.setEnabled(True)
+            # Habilitar OCR si el PDF es imagen
+            es_img = (self._tabla.item(fila, COL_ESTADO) or QTableWidgetItem()
+                      ).data(_USERDATA_IMAGEN) or False
+            self._btn_ocr.setEnabled(bool(es_img))
 
     def _procesar_esta(self):
         """Procesa solo la factura actualmente seleccionada en la lista."""
@@ -1474,12 +1616,70 @@ class VentanaPrincipal(QMainWindow):
                 self._procesar_fila(fila)
             self._btn_plantilla.setEnabled(True)
 
-    def _procesar_ia_uno(self):
-        if not self._ruta_pdf: return
-        self._estado('Analizando con Claude...', '#E65100')
+    def _hacer_ocr(self):
+        """
+        Convierte el PDF imagen seleccionado en un PDF con capa de texto buscable
+        usando Tesseract OCR (gratuito). El PDF resultante se añade a la lista
+        como nueva factura con texto extraíble.
+        """
+        if not self._ruta_pdf:
+            return
+        if not es_pdf_imagen(self._ruta_pdf):
+            QMessageBox.information(
+                self, 'PDF con texto',
+                'Este PDF ya tiene texto extraíble. No necesita OCR.'
+            )
+            return
+
+        self._estado('Ejecutando OCR con Tesseract...', '#E65100')
+        QApplication.processEvents()
         try:
-            texto   = extraer_texto_pdf(self._ruta_pdf)
-            factura = parsear_factura(texto)
+            ruta_ocr = ocr_pdf(self._ruta_pdf)
+        except Exception as e:
+            self._estado('Error OCR', '#C62828')
+            QMessageBox.critical(self, 'Error OCR', str(e))
+            return
+
+        # Reemplazar la factura actual en la lista por la versión OCR'd
+        fila = self._tabla.currentRow()
+        if fila >= 0:
+            item_est = QTableWidgetItem('🟡')
+            item_est.setData(_USERDATA, ruta_ocr)
+            item_est.setData(_USERDATA_IMAGEN, False)   # ya no es imagen
+            self._tabla.setItem(fila, COL_ESTADO,  item_est)
+            nombre_ocr = Path(ruta_ocr).name
+            self._tabla.setItem(fila, COL_FICHERO, QTableWidgetItem(nombre_ocr))
+            for col in (COL_PROV, COL_NUMFAC, COL_TOTAL, COL_VEN):
+                self._tabla.setItem(fila, col, QTableWidgetItem(''))
+
+        # Cargar el PDF OCR'd en el visor
+        self._ruta_pdf = ruta_ocr
+        self._visor.cargar(ruta_ocr)
+        self._btn_ocr.setEnabled(False)
+        self._btn_ia.setEnabled(True)
+        self._estado(
+            f'✔ OCR completado → {Path(ruta_ocr).name}  (ahora puedes procesarla normalmente)',
+            '#2E7D32'
+        )
+        QMessageBox.information(
+            self, 'OCR completado',
+            f'PDF con texto guardado como:\n{ruta_ocr}\n\n'
+            f'La factura ha sido actualizada en la lista y ya puede procesarse '
+            f'con el extractor de texto normal (sin coste de API).'
+        )
+
+    def _procesar_ia_uno(self):
+        """
+        Análisis visual con Claude Vision: renderiza el PDF como imagen y extrae
+        todos los campos independientemente del formato, fondo o encoding.
+        Funciona igual para PDFs con texto, celdas coloreadas o PDFs imagen pura.
+        """
+        if not self._ruta_pdf: return
+        try:
+            self._estado('Analizando con Claude Vision...', '#E65100')
+            QApplication.processEvents()
+            factura = parsear_factura_vision(self._ruta_pdf)
+            texto   = ''
         except Exception as e:
             self._estado('Error IA', '#C62828')
             QMessageBox.critical(self,'Error IA', str(e)); return
@@ -1523,12 +1723,33 @@ class VentanaPrincipal(QMainWindow):
         dlg.exec()
 
     def _mostrar_overlays(self):
-        if not self._prov: return
-        self._visor.set_overlays([
-            {**r, 'color': COLORES_CAMPO.get(r['campo'],'#888'),
+        if not self._prov:
+            return
+
+        # Overlays de plantilla (num_factura, fecha, campos ★auto si los definió el usuario)
+        plantilla_ov = [
+            {**r,
+             'color': COLORES_CAMPO.get(r['campo'], '#888'),
              'label': dict(CAMPOS_PLANTILLA).get(r['campo'], r['campo'])}
             for r in proveedores.obtener_plantilla(self._prov['nif'])
-        ])
+        ]
+
+        # Overlays de importes: localizados dinámicamente en el PDF actual
+        importes_ov = []
+        if self._factura and self._ruta_pdf:
+            try:
+                campos_ya = {r['campo'] for r in plantilla_ov}
+                for r in encontrar_coords_importes(self._ruta_pdf, self._factura):
+                    if r['campo'] not in campos_ya:   # no duplicar si ya tiene coordenada
+                        r['color'] = COLORES_CAMPO.get(r['campo'], '#888')
+                        r['label'] = dict(CAMPOS_PLANTILLA).get(
+                            r['campo'], r['campo']
+                        ).replace('  ★auto', ' ★')
+                        importes_ov.append(r)
+            except Exception:
+                pass
+
+        self._visor.set_overlays(plantilla_ov + importes_ov)
 
 
 def main():
